@@ -1,174 +1,560 @@
-<!doctype html>
-<!--
-  SCU Smart Waste Dashboard: STARTER PROTOTYPE for PROG6002 students.
+"use strict";
+/* =====================================================================================================
+   SCU Smart Waste Dashboard: STARTER PROTOTYPE (PROG6002)
 
-  How the pieces fit together
-  ---------------------------
-    index.html + app.js     the tablet "terminal": classifies rubbish and PUBLISHES MQTT messages
-    dashboard.html + .js    this page: SUBSCRIBES to those messages and displays them
-    bins.js                 shared list of bins (names, colours) used by both pages
+   WHAT THIS FILE DOES
+     1. Connects to an MQTT broker over WebSockets and subscribes to your topic(s).
+     2. Every message that arrives goes through handleMessage(), which decides what kind of message it is.
+     3. The message updates the in-memory STATE (devices, bins, events).
+     4. renderAll() redraws the page from STATE.  Data flows one way:   MQTT -> STATE -> screen.
 
-  This file is only the page STRUCTURE (the boxes). Look for the numbered "SECTION" comments below; every
-  box has an id that dashboard.js fills in. To add a widget: (1) add a <section> here, (2) write a render
-  function in dashboard.js, (3) call it from renderAll().
--->
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SCU Smart Waste Dashboard</title>
+   HOW TO READ IT (top to bottom)
+     A. CONFIG        settings you are expected to change
+     B. STATE         the data the dashboard holds
+     C. MQTT          connect / subscribe / receive
+     D. MESSAGES      turning JSON into STATE  <- edit this if you change the message format in app.js
+     E. CALCULATIONS  bin level, statistics
+     F. RENDERING     STATE -> HTML (bin cards, KPIs, tables, charts)
+     G. MAP           Leaflet map
+     H. SIMULATOR     fake data so you can work without a tablet
+     I. WIRING        buttons, start-up
 
-  <!-- Leaflet: a small open-source map library. Tiles come from OpenStreetMap. Docs: https://leafletjs.com -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+   MESSAGES THIS DASHBOARD UNDERSTANDS  (see also the long comment above buildPayload() in app.js)
 
-  <style>
-    /* ---- Theme: change these colours to restyle the whole page ---- */
-    :root {
-      --bg:#f2f5f7; --card:#ffffff; --ink:#163247; --muted:#5b6f7e; --line:#dce6eb; --brand:#123047;
-      --ok:#12a150; --warn:#e8a200; --bad:#d92d20; --off:#98a2b3;
+     1. "waste_classification": published by the tablet each time it sorts an item.
+        {
+          "message_type": "waste_classification",
+          "device_id": "team01-tablet01",
+          "sequence": 12, "timestamp": "2026-03-10T02:15:00.000Z",
+          "classification": "bottle", "confidence": 0.93,
+          "bin": "yellow",                          // key of BINS in bins.js: red | yellow | green | ewaste | null
+          "location": { "latitude": -28.8034, "longitude": 153.2886, "accuracy_m": 10 }   // or null
+        }
+
+     2. "bin_status": NOT sent by the tablet. This is what a real smart bin (ESP32 + ultrasonic sensor, or
+        a second browser tab) would publish. It gives a MEASURED fill level. Your team decides who sends it.
+        {
+          "message_type": "bin_status",
+          "device_id": "team01-tablet01",
+          "timestamp": "2026-03-10T02:15:00.000Z",
+          "bins": { "yellow": { "level_pct": 63 }, "red": { "level_pct": 20 } },
+          "battery_pct": 87,                        // optional
+          "location": { "latitude": -28.8034, "longitude": 153.2886 }   // optional
+        }
+
+   Without bin_status messages the dashboard ESTIMATES each bin's level from how many items were sorted into
+   it (items / CONFIG.binCapacity). Estimated and measured levels are labelled differently on the cards.
+
+   SECURITY NOTE: a public broker lets anyone publish to your topic. Never put message text into innerHTML.
+   This file only uses textContent (through the el() helper), so a malicious "classification" cannot inject HTML.
+   ===================================================================================================== */
+
+const $ = (id) => document.getElementById(id);
+
+/* =====================================================================================================
+   A. CONFIG: the settings most likely to need changing
+   ===================================================================================================== */
+const CONFIG = {
+  // Must match the tablet (index.html): "Broker WebSocket URL". Browsers need wss:// (or ws:// on http pages).
+  brokerUrl: "wss://broker.hivemq.com:8884/mqtt",
+
+  // Must match (or be a wildcard of) the tablet's "Publish topic". Separate several topics with commas.
+  // "prog6002/2026/team01-tablet01/#"  everything below one device's topic
+  // "prog6002/2026/+/classification"   the classification topic of every device (+ = any one level)
+  topicFilter: "prog6002/2026/team01-tablet01/#",
+
+  // Only used when a bin has NOT reported a measured level: how many items fill one bin (estimate).
+  // Keys must exist in BINS (bins.js). Add a key here if you add a bin there.
+  binCapacity: { red: 20, yellow: 20, green: 20, ewaste: 10 },
+
+  // Traffic-light thresholds, as % full.
+  warnPct: 60,     // amber at or above this
+  fullPct: 85,     // red ("needs emptying") at or above this
+
+  // A device that has sent nothing for this long is shown as offline.
+  offlineAfterMs: 5 * 60 * 1000,
+
+  // Map start position (SCU Lismore campus). The map moves to your devices once they report a location.
+  mapCentre: [-28.8034, 153.2886],
+  mapZoom: 15,
+
+  maxEvents: 2000,        // how many classifications to remember (oldest are dropped)
+  timelineMinutes: 30     // width of the activity chart
+};
+
+/* =====================================================================================================
+   B. STATE: everything the screen is drawn from
+   ===================================================================================================== */
+const BIN_KEYS = Object.keys(BINS);      // ["red","yellow","green","ewaste"], from bins.js, so both pages agree
+
+// devices: Map of device_id -> {
+//   id, lastSeen (ms), location: {lat,lng,accuracy}|null, battery (%)|null, unsorted (count),
+//   bins: { red: { total, sinceEmptied, sensorLevel (%|null) }, yellow: {...}, ... }
+// }
+const devices = new Map();
+// events: newest LAST. Each: { t (ms), device, label, bin, confidence }
+let events = [];
+const seenKeys = new Set();     // used to drop duplicate deliveries (MQTT QoS 1 can deliver a message twice)
+let client = null;              // the MQTT client (null when disconnected)
+let messageCount = 0;
+
+function getDevice(id) {
+  if (!devices.has(id)) {
+    devices.set(id, {
+      id, lastSeen: 0, location: null, battery: null, unsorted: 0,
+      bins: Object.fromEntries(BIN_KEYS.map(k => [k, { total: 0, sinceEmptied: 0, sensorLevel: null }]))
+    });
+    refreshDeviceSelect();
+  }
+  return devices.get(id);
+}
+
+/* =====================================================================================================
+   C. MQTT: connect, subscribe, receive
+   ===================================================================================================== */
+function setStatus(text, kind) {
+  const pill = $("mqttStatus");
+  pill.textContent = text;
+  pill.className = "pill" + (kind ? " " + kind : "");
+}
+
+function connect() {
+  if (client) { client.end(true); client = null; setStatus("Disconnected"); $("connectButton").textContent = "Connect"; return; }
+  if (typeof mqtt === "undefined") { setStatus("MQTT library failed to load", "bad"); return; }
+  const url = $("brokerUrl").value.trim();
+  const topics = $("topicFilter").value.split(",").map(s => s.trim()).filter(Boolean);
+  if (!url || topics.length === 0) { setStatus("Enter a broker URL and topic", "warn"); return; }
+  saveInputs();
+
+  setStatus("Connecting…", "warn");
+  $("connectButton").textContent = "Disconnect";
+  // clientId must be unique per connection, otherwise the broker disconnects the older one.
+  // Add { username, password } here if your broker needs credentials (see the tablet's "Optional broker credentials").
+  client = mqtt.connect(url, { clientId: "dashboard-" + Math.random().toString(16).slice(2, 10), clean: true, reconnectPeriod: 3000, connectTimeout: 10000 });
+
+  // "connect" fires on the first connection AND after every automatic reconnect. Because clean:true wipes
+  // subscriptions, we must subscribe again every time.
+  client.on("connect", () => {
+    setStatus("Connected", "ok");
+    client.subscribe(topics, { qos: 1 }, (err, granted) => {
+      if (err) setStatus("Subscribe failed: " + err.message, "bad");
+      else if (granted.some(g => g.qos === 128)) setStatus("Broker rejected a subscription", "bad");
+    });
+  });
+  client.on("reconnect", () => setStatus("Reconnecting…", "warn"));
+  client.on("offline", () => setStatus("Offline", "warn"));
+  client.on("error", err => setStatus("Error: " + err.message, "bad"));
+  // The single entry point for incoming data. `message` is a Buffer, so convert it to text.
+  client.on("message", (topic, message) => handleMessage(topic, message.toString()));
+}
+
+/* =====================================================================================================
+   D. MESSAGES: turn incoming JSON into STATE
+   To support a NEW message type: add a case to the switch in handleMessage() and write a handler like
+   handleBinStatus(). If you change field names in app.js buildPayload(), update the handlers here to match.
+   ===================================================================================================== */
+function handleMessage(topic, text) {
+  messageCount += 1;
+  logRaw(topic, text);
+
+  let msg;
+  try { msg = JSON.parse(text); } catch { return; }              // not JSON: ignore (it still shows in the raw log)
+  if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
+
+  switch (msg.message_type) {
+    case "waste_classification": handleClassification(msg); break;
+    case "bin_status":           handleBinStatus(msg); break;
+    // case "my_new_type":       handleMyNewType(msg); break;    // <- your own message types go here
+    default: break;                                              // unknown type: ignore it, never crash on it
+  }
+  scheduleRender();
+}
+
+// Common to every message: which device sent it, and where it is.
+function touchDevice(msg) {
+  const id = String(msg.device_id || "unknown").slice(0, 64);
+  const dev = getDevice(id);
+  dev.lastSeen = Date.now();                                     // use arrival time; device clocks can be wrong
+  const loc = msg.location;
+  if (loc && Number.isFinite(loc.latitude) && Number.isFinite(loc.longitude)
+      && Math.abs(loc.latitude) <= 90 && Math.abs(loc.longitude) <= 180) {
+    dev.location = { lat: loc.latitude, lng: loc.longitude, accuracy: Number.isFinite(loc.accuracy_m) ? loc.accuracy_m : null };
+  }
+  return dev;
+}
+
+const isBin = (k) => typeof k === "string" && Object.hasOwn(BINS, k);   // is k a bin defined in bins.js?
+
+function handleClassification(msg) {
+  if (msg.source === "manual_test" || msg.classification === "TEST_ONLY") return;   // "Publish test message" button on the tablet
+
+  // Drop duplicates (same device + sequence + timestamp).
+  const key = `${msg.device_id}|${msg.sequence}|${msg.timestamp}`;
+  if (seenKeys.has(key)) return;
+  seenKeys.add(key);
+  if (seenKeys.size > CONFIG.maxEvents * 2) seenKeys.delete(seenKeys.values().next().value);
+
+  const dev = touchDevice(msg);
+  const bin = isBin(msg.bin) ? msg.bin : null;
+  if (bin) { dev.bins[bin].total += 1; dev.bins[bin].sinceEmptied += 1; } else dev.unsorted += 1;
+
+  events.push({
+    t: Date.now(), device: dev.id, bin,
+    label: String(msg.classification ?? "unknown").slice(0, 40),
+    confidence: Number.isFinite(msg.confidence) ? msg.confidence : null
+  });
+  if (events.length > CONFIG.maxEvents) events.shift();
+}
+
+function handleBinStatus(msg) {
+  const dev = touchDevice(msg);
+  if (Number.isFinite(msg.battery_pct)) dev.battery = Math.round(msg.battery_pct);
+  for (const [bin, info] of Object.entries(msg.bins ?? {})) {
+    if (isBin(bin) && Number.isFinite(info?.level_pct)) {
+      dev.bins[bin].sensorLevel = Math.max(0, Math.min(100, info.level_pct));   // clamp: never trust incoming numbers
     }
-    * { box-sizing:border-box; }
-    body { margin:0; font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--ink); }
-    header { background:var(--brand); color:#fff; padding:12px 20px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; }
-    header h1 { margin:0; font-size:20px; }
-    .eyebrow { display:block; font-size:11px; letter-spacing:.1em; opacity:.7; }
-    main { padding:16px 20px 32px; display:grid; gap:16px; max-width:1300px; margin:0 auto; }
-    .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
-    .panel h2 { margin:0 0 10px; font-size:16px; }
-    .grid { display:grid; gap:16px; }
-    .cols-2 { grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); }
-    .cols-4 { grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
-    .cols-kpi { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
-    label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
-    input, select, button { font:inherit; padding:6px 9px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); }
-    button { cursor:pointer; } button:hover { background:#eef3f6; }
-    button.primary { background:var(--brand); color:#fff; border-color:var(--brand); }
-    .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
-    .toolbar .grow { flex:1 1 240px; }
-    .pill { padding:4px 12px; border-radius:99px; font-size:13px; font-weight:600; background:var(--off); color:#fff; }
-    .pill.ok { background:var(--ok); } .pill.warn { background:var(--warn); } .pill.bad { background:var(--bad); }
-    .help { color:var(--muted); font-size:12px; margin:6px 0 0; }
-    code { background:#eef3f6; padding:1px 4px; border-radius:4px; font-size:12px; }
+  }
+}
 
-    /* KPI tiles */
-    .kpi { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; }
-    .kpi span { font-size:12px; color:var(--muted); }
-    .kpi strong { display:block; font-size:26px; line-height:1.2; }
+/* =====================================================================================================
+   E. CALCULATIONS: values derived from STATE (kept separate from drawing so they are easy to test)
+   ===================================================================================================== */
+const selectedDevices = () => {
+  const id = $("deviceSelect").value;
+  return id ? [devices.get(id)].filter(Boolean) : [...devices.values()];
+};
 
-    /* Bin cards (SECTION 3). The coloured stripe uses the colour from bins.js. */
-    .bin-card { background:var(--card); border:1px solid var(--line); border-top:8px solid var(--line); border-radius:10px; padding:12px 14px; }
-    .bin-card h3 { margin:0; font-size:15px; }
-    .bin-card .sub { font-size:12px; color:var(--muted); min-height:32px; }
-    .gauge { height:14px; background:#e6edf1; border-radius:7px; overflow:hidden; margin:8px 0 4px; }
-    .gauge > div { height:100%; width:0; transition:width .4s, background .4s; }
-    .bin-card .row { display:flex; justify-content:space-between; font-size:13px; }
-    .state { font-weight:700; }
-    .state.ok { color:var(--ok); } .state.warn { color:#a87500; } .state.bad { color:var(--bad); }
+// Fill level of ONE bin on ONE device. A measured value beats an estimate.
+function binLevel(dev, bin) {
+  const b = dev.bins[bin];
+  if (b.sensorLevel !== null) return { pct: b.sensorLevel, source: "measured" };
+  const cap = CONFIG.binCapacity[bin] || 20;
+  return { pct: Math.min(100, (b.sinceEmptied / cap) * 100), source: "estimated" };
+}
 
-    #map { height:380px; border-radius:8px; border:1px solid var(--line); }
-    .note-empty { color:var(--muted); font-style:italic; }
+// One bin across the devices being shown: total items, and the WORST (fullest) level, because that is
+// the one a collection crew needs to know about.
+function summariseBin(list, bin) {
+  let total = 0, worst = { pct: 0, source: "estimated" };
+  for (const d of list) {
+    total += d.bins[bin].total;
+    const lv = binLevel(d, bin);
+    if (lv.pct >= worst.pct) worst = lv;
+  }
+  return { total, ...worst };
+}
 
-    /* Simple bar rows used for "top items" and per-bin counts */
-    .barrow { display:grid; grid-template-columns:110px 1fr 40px; gap:8px; align-items:center; margin:4px 0; font-size:13px; }
-    .bar { height:12px; background:#e6edf1; border-radius:6px; overflow:hidden; }
-    .bar > div { height:100%; background:var(--brand); }
+function levelState(pct) {
+  if (pct >= CONFIG.fullPct) return { text: "Needs emptying", kind: "bad", colour: "#d92d20" };
+  if (pct >= CONFIG.warnPct) return { text: "Filling up", kind: "warn", colour: "#e8a200" };
+  return { text: "OK", kind: "ok", colour: "#12a150" };
+}
 
-    table { width:100%; border-collapse:collapse; font-size:13px; }
-    th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
-    th { color:var(--muted); font-weight:600; font-size:12px; }
-    .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; background:var(--off); }
-    .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
-    .tablewrap { overflow-x:auto; }
-    #rawLog { max-height:220px; overflow:auto; margin:0; padding-left:18px; font:12px/1.4 ui-monospace,Consolas,monospace; }
-    footer { text-align:center; color:var(--muted); font-size:12px; padding:0 0 20px; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg:#0f1a22; --card:#182632; --ink:#e6eef3; --muted:#9db0bd; --line:#2a3d4b; --brand:#2b6d94; }
-      input, select, button { background:#20323f; }
-      button:hover { background:#28404f; } .gauge, .bar { background:#2a3d4b; } code { background:#20323f; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <div><span class="eyebrow">PROG6002 · STARTER PROTOTYPE</span><h1>SCU Smart Waste Dashboard</h1></div>
-    <div id="mqttStatus" class="pill">Disconnected</div>
-  </header>
+const isOnline = (dev) => Date.now() - dev.lastSeen < CONFIG.offlineAfterMs;
 
-  <main>
-    <!-- ============ SECTION 1: MQTT connection + controls ============
-         The broker URL and topic are the two things that must match what the tablet (index.html) uses.
-         "Simulate" feeds fake messages through the same code path so you can build the dashboard
-         without a tablet or bins. -->
-    <section class="panel">
-      <div class="toolbar">
-        <label class="grow">Broker WebSocket URL <input id="brokerUrl"></label>
-        <label class="grow">Subscribe topic(s), comma separated <input id="topicFilter"></label>
-        <button id="connectButton" class="primary">Connect</button>
-        <button id="simButton">Start simulator</button>
-        <button id="resetButton">Reset data</button>
-        <label>Show device
-          <select id="deviceSelect"><option value="">All devices</option></select>
-        </label>
-      </div>
-      <p class="help">Use the same topic as the tablet's <em>Publish topic</em>. <code>+</code> matches one topic level and
-        <code>#</code> matches everything below, e.g. <code>prog6002/2026/+/classification</code> listens to every team.
-        On a public broker anyone can publish to your topic, so treat all incoming data as untrusted.</p>
-    </section>
+function eventsFor(list) {
+  const ids = new Set(list.map(d => d.id));
+  return events.filter(e => ids.has(e.device));
+}
 
-    <!-- ============ SECTION 2: headline numbers (KPIs) ============ -->
-    <section class="grid cols-kpi" id="kpis"></section>
+function computeStats(list) {
+  const evs = eventsFor(list);
+  const perBin = Object.fromEntries(BIN_KEYS.map(k => [k, 0]));
+  const perLabel = {};
+  let confSum = 0, confN = 0;
+  for (const e of evs) {
+    if (e.bin) perBin[e.bin] += 1;
+    perLabel[e.label] = (perLabel[e.label] || 0) + 1;
+    if (e.confidence !== null) { confSum += e.confidence; confN += 1; }
+  }
+  const total = evs.length;
+  const hourAgo = Date.now() - 3600_000;
+  return {
+    total, perBin, perLabel, recent: evs.slice(-10).reverse(),
+    lastHour: evs.filter(e => e.t >= hourAgo).length,
+    // "Diversion rate" = share of items NOT going to landfill (yellow recycling + green organics). Change the
+    // definition to whatever your team decides is a useful measure.
+    diversion: total ? (perBin.yellow + perBin.green) / total : null,
+    avgConfidence: confN ? confSum / confN : null,
+    // Items per minute for the last CONFIG.timelineMinutes minutes (oldest first).
+    timeline: (() => {
+      const n = CONFIG.timelineMinutes, now = Date.now(), buckets = new Array(n).fill(0);
+      for (const e of evs) { const age = Math.floor((now - e.t) / 60000); if (age < n) buckets[n - 1 - age] += 1; }
+      return buckets;
+    })()
+  };
+}
 
-    <!-- ============ SECTION 3: bin status and level of each bin ============ -->
-    <section class="grid cols-4" id="binCards"></section>
+/* =====================================================================================================
+   F. RENDERING: STATE -> HTML
+   scheduleRender() batches many messages into a single redraw per animation frame.
+   ===================================================================================================== */
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; renderAll(); });
+}
 
-    <!-- ============ SECTION 4: map + device list ============ -->
-    <section class="grid cols-2">
-      <article class="panel">
-        <h2>Bin locations</h2>
-        <div id="map"></div>
-        <p id="mapNote" class="help"></p>
-      </article>
-      <article class="panel">
-        <h2>Devices</h2>
-        <div class="tablewrap"><table>
-          <thead><tr><th>Device</th><th>Status</th><th>Last seen</th><th>Items</th><th>Fullest bin</th><th>Location</th></tr></thead>
-          <tbody id="deviceRows"></tbody>
-        </table></div>
-      </article>
-    </section>
+// renderAll() is the table of contents of the page. Add your own render functions here.
+function renderAll() {
+  const list = selectedDevices(), stats = computeStats(list);
+  renderKpis(list, stats);
+  renderBinCards(list);
+  renderDevices();
+  renderBinCounts(stats);
+  renderTopItems(stats);
+  renderTimeline(stats);
+  renderRecent(stats);
+  renderMap();
+}
 
-    <!-- ============ SECTION 5: statistics about rubbish collected ============ -->
-    <section class="grid cols-2">
-      <article class="panel"><h2>Items per bin</h2><div id="binCounts"></div></article>
-      <article class="panel"><h2>Most common items</h2><div id="topItems"></div></article>
-      <article class="panel">
-        <h2>Activity: items per minute (last <span id="timelineMinutes"></span> min)</h2>
-        <div id="timeline"></div>
-      </article>
-      <article class="panel">
-        <h2>Latest classifications</h2>
-        <div class="tablewrap"><table>
-          <thead><tr><th>Time</th><th>Device</th><th>Item</th><th>Bin</th><th>Conf.</th></tr></thead>
-          <tbody id="recentRows"></tbody>
-        </table></div>
-      </article>
-    </section>
+// Small helper to build elements safely (textContent only, never innerHTML).
+// el("div", {class:"x", style:{color:"red"}}, "text", childElement)
+function el(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k === "style") Object.assign(node.style, v);
+    else node.setAttribute(k, v);
+  }
+  node.append(...children.filter(c => c !== null && c !== undefined));
+  return node;
+}
 
-    <!-- ============ SECTION 6: raw messages, for debugging ============
-         When something does not display, look here first: is the message arriving, and does its JSON have the
-         fields dashboard.js expects? -->
-    <section class="panel">
-      <h2>Raw MQTT messages (debug)</h2>
-      <ol id="rawLog"></ol>
-    </section>
-  </main>
+const pct = (v) => v === null ? "—" : Math.round(v * 100) + "%";
+const timeAgo = (ms) => {
+  if (!ms) return "never";
+  const s = Math.round((Date.now() - ms) / 1000);
+  return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+};
 
-  <footer>Prototype for teaching. Extend it: history charts, alerts, collection routes, saved data&hellip; See the TODO ideas in dashboard.js.</footer>
+function renderKpis(list, s) {
+  const online = list.filter(isOnline).length;
+  const tiles = [
+    ["Items sorted", s.total],
+    ["Last hour", s.lastHour],
+    ["Diverted from landfill", pct(s.diversion)],
+    ["Average confidence", pct(s.avgConfidence)],
+    ["Devices online", `${online} / ${list.length}`],
+    ["Messages received", messageCount]
+  ];
+  $("kpis").replaceChildren(...tiles.map(([label, value]) => el("div", { class: "kpi" }, el("span", {}, label), el("strong", {}, String(value)))));
+}
 
-  <!-- Scripts. Order matters: libraries first, then bins.js (defines BINS), then our code. -->
-  <script src="https://unpkg.com/mqtt@5.10.4/dist/mqtt.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="bins.js"></script>
-  <script src="dashboard.js"></script>
-</body>
-</html>
+// One card per bin type (colours and names come from bins.js).
+function renderBinCards(list) {
+  $("binCards").replaceChildren(...BIN_KEYS.map(k => {
+    const info = BINS[k], sum = summariseBin(list, k), st = levelState(sum.pct);
+    const gauge = el("div", { class: "gauge" }, el("div", { style: { width: sum.pct + "%", background: st.colour } }));
+    const card = el("div", { class: "bin-card", style: { borderTopColor: info.colour } },
+      el("h3", {}, info.name),
+      el("div", { class: "sub" }, info.description),
+      gauge,
+      el("div", { class: "row" }, el("span", {}, `${Math.round(sum.pct)}% full (${sum.source})`), el("span", { class: "state " + st.kind }, st.text)),
+      el("div", { class: "row" }, el("span", {}, "Items sorted"), el("strong", {}, String(sum.total)))
+    );
+    return card;
+  }));
+}
+
+function renderDevices() {
+  const rows = [...devices.values()].map(d => {
+    const fullest = Math.max(...BIN_KEYS.map(k => binLevel(d, k).pct));
+    const on = isOnline(d);
+    const items = BIN_KEYS.reduce((n, k) => n + d.bins[k].total, d.unsorted);
+    return el("tr", {},
+      el("td", {}, d.id),
+      el("td", {}, el("span", { class: "dot " + (on ? "ok" : "bad") }), on ? "Online" : "Offline"),
+      el("td", {}, timeAgo(d.lastSeen)),
+      el("td", {}, String(items)),
+      el("td", {}, Math.round(fullest) + "%"),
+      el("td", {}, d.location ? `${d.location.lat.toFixed(4)}, ${d.location.lng.toFixed(4)}` : "no GPS")
+    );
+  });
+  $("deviceRows").replaceChildren(...(rows.length ? rows : [el("tr", {}, el("td", { colspan: 6, class: "note-empty" }, "No devices yet. Connect, or start the simulator."))]));
+}
+
+// Generic horizontal bar list, reused for bins and items.
+function barRows(entries, colourFor) {
+  const max = Math.max(1, ...entries.map(e => e[1]));
+  if (!entries.length) return [el("p", { class: "note-empty" }, "No data yet.")];
+  return entries.map(([label, n]) => el("div", { class: "barrow" },
+    el("span", {}, label),
+    el("div", { class: "bar" }, el("div", { style: { width: (n / max) * 100 + "%", background: colourFor(label) } })),
+    el("span", {}, String(n))));
+}
+
+function renderBinCounts(s) {
+  $("binCounts").replaceChildren(...barRows(BIN_KEYS.map(k => [BINS[k].name, s.perBin[k]]),
+    name => BINS[BIN_KEYS.find(k => BINS[k].name === name)].colour));
+}
+
+function renderTopItems(s) {
+  const top = Object.entries(s.perLabel).sort((a, b) => b[1] - a[1]).slice(0, 8);
+  $("topItems").replaceChildren(...barRows(top, () => "var(--brand)"));
+}
+
+// A tiny hand-drawn SVG bar chart. For richer charts, try Chart.js (https://www.chartjs.org).
+function renderTimeline(s) {
+  $("timelineMinutes").textContent = CONFIG.timelineMinutes;
+  const W = 600, H = 120, n = s.timeline.length, max = Math.max(1, ...s.timeline), bw = W / n;
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", "100%");
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Items sorted per minute");
+  s.timeline.forEach((v, i) => {
+    const h = (v / max) * (H - 10), r = document.createElementNS(NS, "rect");
+    r.setAttribute("x", i * bw + 1); r.setAttribute("y", H - h); r.setAttribute("width", bw - 2); r.setAttribute("height", h);
+    r.setAttribute("fill", "#2b6d94");
+    svg.append(r);
+  });
+  $("timeline").replaceChildren(svg);
+}
+
+function renderRecent(s) {
+  const rows = s.recent.map(e => el("tr", {},
+    el("td", {}, new Date(e.t).toLocaleTimeString()),
+    el("td", {}, e.device),
+    el("td", {}, e.label),
+    el("td", {}, e.bin ? BINS[e.bin].name : "—"),
+    el("td", {}, pct(e.confidence))));
+  $("recentRows").replaceChildren(...(rows.length ? rows : [el("tr", {}, el("td", { colspan: 5, class: "note-empty" }, "Nothing yet."))]));
+}
+
+// Raw message log (newest first, capped). The first thing to check when the display looks wrong.
+function logRaw(topic, text) {
+  const li = el("li", {}, `${new Date().toLocaleTimeString()} ${topic} ${text.slice(0, 300)}`);
+  $("rawLog").prepend(li);
+  while ($("rawLog").children.length > 40) $("rawLog").lastChild.remove();
+}
+
+function refreshDeviceSelect() {
+  const sel = $("deviceSelect"), current = sel.value;
+  sel.replaceChildren(el("option", { value: "" }, "All devices"), ...[...devices.keys()].map(id => el("option", { value: id }, id)));
+  sel.value = devices.has(current) ? current : "";
+}
+
+/* =====================================================================================================
+   G. MAP (Leaflet). One coloured circle per device that has reported a location.
+   Colour = worst bin on that device (green / amber / red), grey if the device is offline.
+   ===================================================================================================== */
+let map = null, mapFitted = false;
+const markers = new Map();     // device id -> Leaflet marker
+
+function initMap() {
+  if (typeof L === "undefined") { $("mapNote").textContent = "Map library failed to load (check the internet connection)."; return; }
+  map = L.map("map").setView(CONFIG.mapCentre, CONFIG.mapZoom);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
+}
+
+function renderMap() {
+  if (!map) return;
+  const located = [...devices.values()].filter(d => d.location);
+  $("mapNote").textContent = located.length
+    ? ""
+    : "No device has sent a location yet. On the tablet tick “Include GPS location in messages” (needs HTTPS), or use the simulator.";
+
+  for (const d of located) {
+    const fullest = Math.max(...BIN_KEYS.map(k => binLevel(d, k).pct));
+    const colour = isOnline(d) ? levelState(fullest).colour : "#98a2b3";
+    let m = markers.get(d.id);
+    if (!m) { m = L.circleMarker([d.location.lat, d.location.lng], { radius: 11, weight: 2, color: "#123047", fillOpacity: 0.85 }).addTo(map); markers.set(d.id, m); }
+    m.setLatLng([d.location.lat, d.location.lng]).setStyle({ fillColor: colour });
+    // Popup content is a DOM element (not an HTML string) so device names cannot inject markup.
+    m.bindPopup(el("div", {}, el("strong", {}, d.id),
+      ...BIN_KEYS.map(k => el("div", {}, `${BINS[k].name}: ${Math.round(binLevel(d, k).pct)}%`)),
+      el("div", {}, "Last seen " + timeAgo(d.lastSeen))));
+  }
+  // Zoom to fit the devices the first time (not every update, or the map would fight the user's panning).
+  if (located.length && !mapFitted) {
+    map.fitBounds(L.latLngBounds(located.map(d => [d.location.lat, d.location.lng])).pad(0.3), { maxZoom: 17 });
+    mapFitted = true;
+  }
+}
+
+/* =====================================================================================================
+   H. SIMULATOR: pushes made-up messages through handleMessage(), exactly as if they came from MQTT.
+   Handy for building the dashboard before anyone has a working tablet or bin.
+   To test with real MQTT instead, publish these same JSON shapes from the tablet's "Publish test message" box.
+   ===================================================================================================== */
+let simTimer = null;
+const SIM_DEVICES = [
+  { id: "sim-bin-01", lat: -28.8034, lng: 153.2886, count: 0 },
+  { id: "sim-bin-02", lat: -28.8042, lng: 153.2899, count: 0 },
+  { id: "sim-bin-03", lat: -28.8027, lng: 153.2871, count: 0 }
+];
+// Items a simulated bin can "see", taken from bins.js (skipping labels mapped to "ignore").
+const SIM_LABELS = Object.entries(DEFAULT_COCO_BINS).filter(([, bin]) => bin !== "ignore");
+
+function simulateTick() {
+  const sim = SIM_DEVICES[Math.floor(Math.random() * SIM_DEVICES.length)];
+  const [label, bin] = SIM_LABELS[Math.floor(Math.random() * SIM_LABELS.length)];
+  sim.count += 1;
+  const location = { latitude: sim.lat, longitude: sim.lng, accuracy_m: 10 };
+  handleMessage("sim/classification", JSON.stringify({
+    schema_version: 2, message_type: "waste_classification", device_id: sim.id, sequence: sim.count,
+    timestamp: new Date().toISOString(), source: "simulator", bin, classification: label,
+    confidence: Number((0.6 + Math.random() * 0.4).toFixed(2)), location
+  }));
+  if (sim.count % 6 === 0) {       // now and then a "smart bin" reports a measured level too
+    handleMessage("sim/binstatus", JSON.stringify({
+      schema_version: 1, message_type: "bin_status", device_id: sim.id, timestamp: new Date().toISOString(),
+      bins: Object.fromEntries(BIN_KEYS.map(k => [k, { level_pct: Math.min(100, Math.round(Math.random() * 60 + sim.count)) }])),
+      battery_pct: Math.max(5, 100 - sim.count), location
+    }));
+  }
+}
+
+function toggleSimulator() {
+  if (simTimer) { clearInterval(simTimer); simTimer = null; $("simButton").textContent = "Start simulator"; return; }
+  simTimer = setInterval(simulateTick, 1200);
+  $("simButton").textContent = "Stop simulator";
+}
+
+function resetData() {
+  devices.clear(); events = []; seenKeys.clear(); messageCount = 0;
+  SIM_DEVICES.forEach(s => { s.count = 0; });
+  markers.forEach(m => m.remove()); markers.clear(); mapFitted = false;
+  $("rawLog").replaceChildren();
+  refreshDeviceSelect(); renderAll();
+}
+
+/* =====================================================================================================
+   I. WIRING + START-UP
+   ===================================================================================================== */
+const INPUT_KEY = "prog6002-dashboard";
+function saveInputs() {
+  try { localStorage.setItem(INPUT_KEY, JSON.stringify({ brokerUrl: $("brokerUrl").value, topicFilter: $("topicFilter").value })); } catch {}
+}
+function loadInputs() {
+  $("brokerUrl").value = CONFIG.brokerUrl; $("topicFilter").value = CONFIG.topicFilter;
+  try {
+    const saved = JSON.parse(localStorage.getItem(INPUT_KEY) || "{}");
+    if (saved.brokerUrl) $("brokerUrl").value = saved.brokerUrl;
+    if (saved.topicFilter) $("topicFilter").value = saved.topicFilter;
+  } catch {}
+}
+
+$("connectButton").addEventListener("click", connect);
+$("simButton").addEventListener("click", toggleSimulator);
+$("resetButton").addEventListener("click", resetData);
+$("deviceSelect").addEventListener("change", renderAll);
+
+loadInputs();
+initMap();
+renderAll();
+// Redraw every 10 s so "last seen", online/offline and the activity chart stay correct when no messages arrive.
+setInterval(renderAll, 10000);
+
+/* =====================================================================================================
+   IDEAS FOR YOUR OWN DASHBOARD (pick some, invent more)
+     - Save events to localStorage or IndexedDB so a page reload keeps the history.
+     - Alerts: play a sound / show a banner when a bin passes CONFIG.fullPct.
+     - A "Mark emptied" button that sets dev.bins[k].sinceEmptied = 0 and sensorLevel = 0.
+     - Fill-level history chart per bin (store {t, level} in a list each time a bin_status arrives).
+     - Collection route: order the full bins by distance from the depot and draw a Leaflet polyline.
+     - Contamination view: highlight low-confidence items or bins with many "unsorted" items.
+     - Publish commands BACK to a device (e.g. topic ".../command") using client.publish().
+     - Replace the hand-made SVG chart with Chart.js, or the raw JSON log with a searchable table.
+   ===================================================================================================== */
