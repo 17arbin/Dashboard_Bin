@@ -206,6 +206,31 @@ function handlePico(topic, msg, packet) {
   const p = d.pico || (d.pico = {boot:null, seq:-1, lastHeartbeat:0,
     retired:new Set(), pending:new Map(), sample:null, sampleUptime:-1, lid:null});
   const kind = match[2];
+  if (kind === "heartbeat" && msg.boot_id === undefined && msg.status === "alive" && Number.isFinite(msg.uptime_seconds)) {
+    if (packet.retain) return true;
+    p.legacy = true;
+    if (p.lastHeartbeat && msg.uptime_seconds * 1000 < p.heartbeatUptime) {
+      p.sample = null; p.sampleUptime = -1;
+      if (pendingCommand?.device === d.id) {pendingCommand=null; commandNotice="Pico restarted; command outcome unknown.";}
+    }
+    p.heartbeatUptime = msg.uptime_seconds * 1000;
+    p.lastHeartbeat = d.lastSeen = Date.now(); p.offline = false;
+    return true;
+  }
+  if (kind === "telemetry" && msg.boot_id === undefined && Number.isFinite(msg.uptime_seconds)) {
+    // This firmware puts its boot identifier inside message_id, not in a separate field.
+    const id = typeof msg.message_id === "string" ? msg.message_id : "";
+    const boot = id.includes("-") ? id.slice(0,id.lastIndexOf("-")) : null;
+    if (boot && p.retired.has(boot)) return true;
+    if (boot && p.sampleBoot !== boot) {
+      if (p.sampleBoot) p.retired.add(p.sampleBoot);
+      if (p.retired.size > 16) p.retired.delete(p.retired.values().next().value);
+      p.sampleBoot=boot; p.sampleUptime=-1;
+    }
+    applyPicoTelemetry(d,msg); return true;
+  }
+  if (kind === "status" && msg.status === "offline") {p.offline=true; return true;}
+  if (kind === "alerts") {p.condition=msg.condition; return true;}
   if (kind === "heartbeat") {
     if (packet.retain || msg.status !== "alive" || typeof msg.boot_id !== "string" ||
         !Number.isFinite(msg.uptime_ms) || !Number.isInteger(msg.seq) || p.retired.has(msg.boot_id)) return true;
@@ -215,6 +240,7 @@ function handlePico(topic, msg, packet) {
       p.boot = msg.boot_id; p.lastSentSeq = 0; p.seq = -1; p.sample = null; p.sampleUptime = -1; p.lid = null;
     }
     if (msg.seq <= p.seq) return true;
+    p.legacy = false; p.offline = false;
     p.seq = msg.seq; p.heartbeatUptime = msg.uptime_ms;
     p.nextCommandSeq = msg.next_command_seq;
     p.lastHeartbeat = d.lastSeen = Date.now();
@@ -230,6 +256,10 @@ function handlePico(topic, msg, packet) {
       if (p.pending.size > 4) p.pending.delete(p.pending.keys().next().value);
     }
   } else if (kind === "lid/status" && ["open", "closed"].includes(msg.state)) {
+    if (!packet.retain && pendingCommand?.device === d.id && pendingCommand.payload.command_id === msg.command_id) {
+      commandNotice = d.id+": Pico reports lid "+msg.state+" for this command.";
+      pendingCommand=null;
+    }
     p.lid = msg.state; // Reported command state, not a physical position sensor.
   } else if (kind === "command/ack") {
     p.ack = String(msg.status || "unknown");
@@ -262,10 +292,10 @@ function renderPicoDetails(list) {
     const p = d.pico, m = p.sample || {};
     const num = (v, suffix) => Number.isFinite(v) ? v.toFixed(1) + suffix : "—";
     return el("tr", {}, ...[d.id, p.lid || m.lid_state || "unknown", m.sensor_status || "awaiting telemetry",
-      num(m.distance?.smoothed_cm, " cm"), num(m.cpu_temperature_c," °C"),
+      num(m.distance?.smoothed_cm ?? m.distance_cm, " cm"), num(m.cpu_temperature_c," °C"),
       num(Number.isFinite(m.free_memory_bytes) ? m.free_memory_bytes/1024 : null," KiB"),
       num(m.uptime_seconds," s"), p.sample ? Math.round(picoAge(p)/1000)+" s" : "—",
-      m.condition || "—"].map(v => el("td",{},v)));
+      p.condition || m.condition || "—"].map(v => el("td",{},v)));
   });
   $("picoRows").replaceChildren(...(rows.length ? rows : [el("tr",{},el("td",{colspan:9},"Awaiting Pico messages."))]));
 }
@@ -359,7 +389,7 @@ function levelState(pct) {
 }
 
 const isOnline = (dev) => dev.pico
-  ? Boolean(client?.connected && dev.pico.lastHeartbeat && Date.now() - dev.pico.lastHeartbeat < 30000)
+  ? Boolean(client?.connected && dev.pico.lastHeartbeat && !dev.pico.offline && Date.now() - dev.pico.lastHeartbeat < (dev.pico.legacy ? 90000 : 30000))
   : Date.now() - dev.lastSeen < CONFIG.offlineAfterMs;
 
 function eventsFor(list) {
@@ -639,6 +669,7 @@ const latestPayloads = new Map();
 let pendingCommand = null;
 let commandNotice = "Waiting for a live Pico heartbeat.";
 function controlReady(d) {
+  if (d?.pico?.legacy) return isOnline(d);
   return Boolean(d?.pico && isOnline(d) && Date.now()-d.pico.lastHeartbeat < 15000 &&
     Number.isInteger(d.pico.nextCommandSeq) && d.pico.nextCommandSeq > 0);
 }
@@ -652,7 +683,7 @@ function renderControls() {
   // Close can supersede an unacknowledged open.
   $("closeLid").disabled = !controlReady(d);
   $("commandState").textContent = commandNotice +
-    (!controlReady(d) ? " Controls need a connected broker and a fresh heartbeat with next_command_seq." : "");
+    (!controlReady(d) ? " Controls need a connected broker and a fresh heartbeat matching the running firmware." : "");
 }
 function sendLidCommand(action) {
   const d = devices.get($("controlBin").value);
@@ -663,18 +694,19 @@ function sendLidCommand(action) {
   p.lastSentSeq = seq;
   const payload = {command_id:"web-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,10),
     action, boot_id:p.boot, seq, issued_uptime_ms:p.heartbeatUptime, duration_s:5};
-  pendingCommand = {device:d.id, payload, text:JSON.stringify(payload), attempts:0, lastSent:0};
+  if (p.legacy) {delete payload.boot_id; delete payload.seq; delete payload.issued_uptime_ms;}
+  pendingCommand = {legacy:Boolean(p.legacy), device:d.id, payload, text:JSON.stringify(payload), attempts:0, lastSent:0};
   publishCommand(); renderControls();
 }
 function publishCommand() {
   const c = pendingCommand, d = c && devices.get(c.device);
   if (!c) return;
-  if (!controlReady(d) || d.pico.boot !== c.payload.boot_id) {
+  if (!controlReady(d) || (!c.legacy && d.pico.boot !== c.payload.boot_id)) {
     commandNotice = "Command delivery uncertain: connection/heartbeat changed. No further retries.";
     pendingCommand = null; return;
   }
   c.attempts++; c.lastSent = Date.now();
-  commandNotice = c.device+": waiting for Pico acknowledgement (attempt "+c.attempts+"/3).";
+  commandNotice = c.legacy ? c.device+": sent; waiting for matching lid/status." : c.device+": waiting for Pico acknowledgement (attempt "+c.attempts+"/3).";
   // QoS 0 avoids broker/client replay queues for actuator commands. Application retries
   // reuse the exact ID and body, so Pico deduplication prevents extending the lid timer.
   try { client.publish("smartbin/"+c.device+"/command/lid",c.text,{qos:0,retain:false}); }
@@ -682,6 +714,11 @@ function publishCommand() {
 }
 function tickCommands() {
   if (!pendingCommand || Date.now()-pendingCommand.lastSent < 3000) return;
+  if (pendingCommand.legacy) {
+    if (Date.now()-pendingCommand.lastSent < 10000) return;
+    commandNotice="No matching lid/status within 10 seconds. Outcome unknown; inspect Wokwi. Command was not resent.";
+    pendingCommand=null; renderControls(); return;
+  }
   if (pendingCommand.attempts >= 3) {
     commandNotice = "No Pico acknowledgement after 3 attempts. Outcome unknown; check lid state. The Pico owns the closing timer.";
     pendingCommand = null;

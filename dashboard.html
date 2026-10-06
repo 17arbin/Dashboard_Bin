@@ -115,7 +115,7 @@
       </div>
       <p class="help">Enter your HiveMQ MQTT credentials (not your HiveMQ website login). Credentials are not saved by this dashboard.
         Use <code>smartbin/BIN001/#</code> for your Pico. Select which bin its single sensor measures.
-        Keep the simulator off for live readings. Heartbeats: every 10 seconds; overdue after 30 seconds.
+        Keep the simulator off for live readings. Your firmware: heartbeat every 30 seconds; overdue after 90 seconds.
         Classification charts need separate tablet classification messages; the distance sensor cannot count or identify items.</p>
     </section>
 
@@ -184,7 +184,7 @@
   <script src="https://unpkg.com/mqtt@5.10.4/dist/mqtt.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="bins.js"></script>
-  <script src="dashboard.js"></script>
+  <script src="dashboard.js?v=legacy-fix-3"></script>
 </body>
 </html>
 
